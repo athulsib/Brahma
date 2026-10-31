@@ -1,0 +1,10 @@
+/target
+/worlds
+.idea/
+*.txt.tmp
+__pycache__/
+# First-run prepare writes jars and the resource bundle under .local.
+# They are the player's Minecraft files and are never committed.
+.local/
+*.jar
+prepare/.local/

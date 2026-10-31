@@ -1,0 +1,51 @@
+[package]
+name = "brahma"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Athulsib"]
+rust-version = "1.85"
+description = "Standalone Minecraft: Java Edition 26.3 world generator and chunk pregenerator. Terrain is Horizon's clean-room generator."
+
+[[bin]]
+name = "brahma"
+path = "src/main.rs"
+
+[dependencies]
+# Horizon's generator and world data, pinned to one commit of the game's
+# repository: bump `rev` deliberately, after rerunning tools/verify_parity.py.
+horizon-world = { git = "https://github.com/horizon-rust/horizon.git", rev = "f4da935e0ffdb681dd06ebdf9c4a26aff6173df5" }
+horizon-core = { git = "https://github.com/horizon-rust/horizon.git", rev = "f4da935e0ffdb681dd06ebdf9c4a26aff6173df5" }
+# `prepare_generator` is on this checkout and is not in the pinned revision yet.
+# Switch this to the same git rev once that function is on it.
+horizon-prepare = { path = "../horizon/crates/horizon-prepare" }
+serde_json = "1"
+# WGSL for `--quality fast`, dispatched on Vulkan. A machine without Vulkan
+# uses the CPU grids.
+naga = { version = "30.0.1", default-features = false, features = ["wgsl-in", "spv-out"] }
+ash = "0.38"
+
+# The fast fill (`ProtoChunk::from_approximate`) is on this checkout, not the pinned rev.
+[patch."https://github.com/horizon-rust/horizon.git"]
+horizon-world = { path = "../horizon/crates/horizon-world" }
+horizon-core = { path = "../horizon/crates/horizon-core" }
+
+# libloading 0.8's Windows backend uses raw-dylib, and dlltool on this GNU
+# toolchain cannot spawn an assembler. The shim loads vulkan-1.dll the same way.
+[patch.crates-io]
+libloading = { path = "shim/libloading" }
+
+[profile.dev.build-override]
+opt-level = 3
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Optimized but quick to link, for iteration: cargo build --profile fast
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

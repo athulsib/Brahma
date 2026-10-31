@@ -1,0 +1,11 @@
+[package]
+name = "libloading"
+version = "0.8.9"
+edition = "2021"
+license = "MIT"
+description = "LoadLibraryW/GetProcAddress stand-in so Vulkan can link without dlltool"
+publish = false
+
+[features]
+default = ["std"]
+std = []
