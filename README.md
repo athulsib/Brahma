@@ -1,5 +1,6 @@
 
-<h1 style="text-align: center">Brahma</h1>
+<div align="center">
+<h1>Brahma</h1>
 <p align="center">
 <img src="https://img.shields.io/badge/Minecraft-Java%2026.3-5D9C3F" alt="Minecraft Java 26.3">
   <img src="https://img.shields.io/badge/Rust-stable-B7410E?logo=rust&logoColor=white" alt="Rust">
@@ -7,6 +8,7 @@
   <img src="https://img.shields.io/badge/platform-Linux%20%20%7C%20Windows-2A2470" alt="Linux, macOS and Windows">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3B2F7E" alt="MIT license"></a>
 </p>
+</div>
 
 Brahma is an ultra-fast Minecraft world and chunk generator, written in Rust. It pregenerates Minecraft: Java Edition 26.3 worlds in parallel, skips lighting, and can use a fast mode that drops the density math and runs on the GPU.
 
