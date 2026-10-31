@@ -11,6 +11,7 @@ mod chunk_nbt;
 mod dump;
 mod fast_terrain;
 mod level;
+mod menu;
 mod pipeline;
 mod resources;
 mod restore;
@@ -24,6 +25,8 @@ const HELP: &str = "\
 brahma: Minecraft: Java Edition 26.3 world generator and pregenerator
 
 USAGE
+  brahma
+        Menu. With no terminal, this help is printed.
   brahma generate --out <world dir> --seed <i64|text>
         [--resources <dir>] [--minecraft-dir <dir>] [--server-jar <jar>]
         [--java-home <dir>] [--name <level name>] [--radius <blocks>]
@@ -271,6 +274,13 @@ fn parse_generate(args: &[String]) -> Result<GenerateArgs, Error> {
 
 fn run(args: &[String]) -> Result<(), Error> {
     match args.first().map(String::as_str) {
+        None if menu::is_terminal() => match menu::run()? {
+            None => Ok(()),
+            Some(args) => {
+                menu::mark_ran();
+                pipeline::generate(&args)
+            }
+        },
         None | Some("--help" | "-h" | "help") => {
             print!("{HELP}");
             Ok(())
@@ -337,11 +347,16 @@ fn run(args: &[String]) -> Result<(), Error> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
+    let code = match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("brahma: {error}");
             ExitCode::from(2)
         }
+    };
+    // After the result is on screen, including a generate error printed above.
+    if menu::ran() {
+        menu::pause();
     }
+    code
 }

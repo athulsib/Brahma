@@ -1,0 +1,871 @@
+diff --git a/crates/horizon-prepare/src/exporters.rs b/crates/horizon-prepare/src/exporters.rs
+index 35992c8b5..d4c92e12b 100644
+--- a/crates/horizon-prepare/src/exporters.rs
++++ b/crates/horizon-prepare/src/exporters.rs
+@@ -1,218 +1,238 @@
+-//! Only original Horizon classes are packaged. The pinned jars remain player supplied.
+-use crate::*;
+-
+-const SETTINGS: &str = "exporters-v1 --release -proc:none -encoding UTF-8";
+-const SERVER: &[&str] = &[
+-    "VanillaHeightmapOracle",
+-    "VanillaBlockLandingOracle",
+-    "VanillaEntityAttributeOracle",
+-    "VanillaPlayerHealthOracle",
+-    "VanillaDamageSourceOracle",
+-    "VanillaCollisionOracle",
+-    "VanillaFaceVisibilityOracle",
+-    "VanillaGameplayFactsExporter",
+-    "VanillaEntityTypesExporter",
+-    "VanillaBlockBehaviourExporter",
+-    "VanillaCommandParseOracle",
+-    "VanillaCreativeTabsExporter",
+-    "VanillaSimpleBlockOracle",
+-    "VanillaStructureBlockExporter",
+-    "PrepareWorker",
+-];
+-const CLIENT: &[&str] = &[
+-    "VanillaBlockStateBindingOracle",
+-    "VanillaEntityModelExporter",
+-    "VanillaMobDataExporter",
+-    "PrepareWorker",
+-];
+-
+-fn files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+-    let mut result = Vec::new();
+-    for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+-        let path = entry.map_err(|e| e.to_string())?.path();
+-        if path.is_dir() {
+-            result.extend(files(&path)?);
+-        } else {
+-            result.push(path);
+-        }
+-    }
+-    result.sort();
+-    Ok(result)
+-}
+-
+-// research-lock pins both jars and every accepted client manifest (which pins its libraries).
+-// artifacts::verify/client_libraries check those dependencies before any bundle is used.
+-fn key(root: &Path) -> Result<String, String> {
+-    let mut hash = sha2::Sha256::new();
+-    hash.update(SETTINGS);
+-    // The launcher's bundled preparer may differ from the selected game's. Hash that
+-    // version's compiler settings so a newer release still selects a runtime correctly.
+-    let compiler = fs::read_to_string(root.join("crates/horizon-prepare/src/exporters.rs"))
+-        .unwrap_or_else(|_| include_str!("exporters.rs").into());
+-    hash.update(compiler.replace('\r', ""));
+-    let mut sources = files(&root.join(PARITY))?;
+-    sources.retain(|p| p.extension().is_some_and(|e| e == "java"));
+-    sources.push(root.join("research-lock.json"));
+-    for path in sources {
+-        let data: Vec<_> = read(&path)?.into_iter().filter(|b| *b != b'\r').collect();
+-        hash.update(format!(
+-            "{}\0{}\0",
+-            relative_display(&path, root)?.replace('\\', "/"),
+-            data.len()
+-        ));
+-        hash.update(data);
+-    }
+-    Ok(hex(&hash.finalize()))
+-}
+-
+-fn outputs(dir: &Path) -> Result<Value, String> {
+-    let mut hashes = Value::Object(Vec::new());
+-    for path in files(dir)? {
+-        if path.extension().is_some_and(|e| e == "class") {
+-            let name = relative_display(&path, dir)?.replace('\\', "/");
+-            // javac's sourcepath contains our sources only; enforce that at packaging too.
+-            if !name.starts_with("server/dev/horizonlab/parity/")
+-                && !name.starts_with("client/dev/horizonlab/parity/")
+-            {
+-                return Err(format!("Non-Horizon class in exporter bundle: {name}"));
+-            }
+-            hashes.insert(&name, Value::Str(digest(&path, "sha256")?));
+-        }
+-    }
+-    Ok(hashes)
+-}
+-
+-fn valid(dir: &Path, key: &str) -> bool {
+-    let Ok(manifest) = read_json(&dir.join("manifest.json")) else {
+-        return false;
+-    };
+-    manifest.get("key").and_then(Value::as_str) == Some(key)
+-        && outputs(dir).is_ok_and(|hashes| {
+-            !hashes.as_object().unwrap().is_empty() && manifest.get("classes") == Some(&hashes)
+-        })
+-}
+-
+-/// Whether the version ships a matching, intact bundle and needs only a Java runtime.
+-pub fn available(root: &Path) -> bool {
+-    key(root).is_ok_and(|key| valid(&root.join("exporters"), &key))
+-}
+-
+-pub(crate) fn classes(run: &Run) -> Result<PathBuf, String> {
+-    let key = key(&run.root)?;
+-    let shipped = run.root.join("exporters");
+-    if valid(&shipped, &key) {
+-        return Ok(shipped);
+-    }
+-    let cached = run.local.join("exporters").join(&key);
+-    if valid(&cached, &key) {
+-        return Ok(cached);
+-    }
+-    // Build privately: an interrupted compiler or another preparer cannot publish partial classes.
+-    let destination = cached;
+-    let cached = run
+-        .local
+-        .join("exporters")
+-        .join(format!(".{key}-{}", std::process::id()));
+-    if cached.exists() {
+-        fs::remove_dir_all(&cached).map_err(|e| e.to_string())?;
+-    }
+-    mkdir(&cached)?;
+-    let jdk = java::find(run.java_major, &[run.jdk.home()])?;
+-    for (side, mains, cp) in [
+-        ("server", SERVER, &run.server_classpath),
+-        ("client", CLIENT, &run.client_classpath),
+-    ] {
+-        (run.log)(&format!("Compiling {side} exporters (shared helpers once)"));
+-        let classes = cached.join(side);
+-        mkdir(&classes)?;
+-        let log = run.log_file(&cached.join(format!("{side}.log")))?;
+-        let mut args = vec![
+-            "-encoding".into(),
+-            "UTF-8".into(),
+-            "-cp".into(),
+-            cp.clone(),
+-            "-sourcepath".into(),
+-            arg(&run.root.join("mods/horizon/src/test/java")),
+-            "-d".into(),
+-            arg(&classes),
+-        ];
+-        args.extend(mains.iter().map(|n| arg(&run.oracle(&format!("{n}.java")))));
+-        jdk.javac(run.java_major, &args, &log)?;
+-        let validate = vec![
+-            "-Xverify:all".into(),
+-            "-cp".into(),
+-            format!(
+-                "{}{}{}",
+-                classes.display(),
+-                if cfg!(windows) { ";" } else { ":" },
+-                cp
+-            ),
+-            "dev.horizonlab.parity.PrepareWorker".into(),
+-            "validate".into(),
+-            arg(&classes),
+-        ];
+-        // No exporter executes here: resolve every class and its signatures against pinned jars.
+-        run.jdk.java(&validate, None, &log)?;
+-    }
+-    let manifest = Value::Object(vec![
+-        ("key".into(), Value::Str(key.clone())),
+-        ("classes".into(), outputs(&cached)?),
+-    ]);
+-    write_json(&cached.join("manifest.json"), &manifest)?;
+-    if valid(&destination, &key) {
+-        fs::remove_dir_all(&cached).map_err(|e| e.to_string())?;
+-    } else {
+-        if destination.exists() {
+-            fs::remove_dir_all(&destination).map_err(|e| e.to_string())?;
+-        }
+-        fs::rename(&cached, &destination).map_err(|e| e.to_string())?;
+-    }
+-    Ok(destination)
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn bundles_invalidate_sources_pins_and_damaged_classes() {
+-        let root = std::env::temp_dir().join(format!("prepare-bundle-{}", std::process::id()));
+-        let source = root.join(PARITY).join("VanillaHeightmapOracle.java");
+-        mkdir(source.parent().unwrap()).unwrap();
+-        write(&source, b"original\n").unwrap();
+-        let compiler = root.join("crates/horizon-prepare/src/exporters.rs");
+-        mkdir(compiler.parent().unwrap()).unwrap();
+-        write(&compiler, b"--release 25 -proc:none").unwrap();
+-        write(&root.join("research-lock.json"), b"pins").unwrap();
+-        let original = key(&root).unwrap();
+-        write(&compiler, b"--release 26 -proc:none").unwrap();
+-        assert_ne!(key(&root).unwrap(), original);
+-        write(&compiler, b"--release 25 -proc:none").unwrap();
+-        write(&source, b"original\r\n").unwrap();
+-        assert_eq!(key(&root).unwrap(), original);
+-        write(&source, b"changed").unwrap();
+-        assert_ne!(key(&root).unwrap(), original);
+-        write(&source, b"original\n").unwrap();
+-        write(&root.join("research-lock.json"), b"new dependencies").unwrap();
+-        assert_ne!(key(&root).unwrap(), original);
+-        write(&root.join("research-lock.json"), b"pins").unwrap();
+-        let bundle = root.join("exporters");
+-        let class = bundle.join("server/dev/horizonlab/parity/Helper.class");
+-        mkdir(class.parent().unwrap()).unwrap();
+-        write(&class, b"compiled").unwrap();
+-        write_json(
+-            &bundle.join("manifest.json"),
+-            &Value::Object(vec![
+-                ("key".into(), Value::Str(original)),
+-                ("classes".into(), outputs(&bundle).unwrap()),
+-            ]),
+-        )
+-        .unwrap();
+-        assert!(available(&root));
+-        write(&class, b"damaged").unwrap();
+-        assert!(!available(&root));
+-        fs::remove_file(&class).unwrap();
+-        assert!(!available(&root));
+-        fs::remove_dir_all(root).unwrap();
+-    }
+-}
++//! Only original Horizon classes are packaged. The pinned jars remain player supplied.
++use crate::*;
++
++const SETTINGS: &str = "exporters-v1 --release -proc:none -encoding UTF-8";
++const SERVER: &[&str] = &[
++    "VanillaHeightmapOracle",
++    "VanillaBlockLandingOracle",
++    "VanillaEntityAttributeOracle",
++    "VanillaPlayerHealthOracle",
++    "VanillaDamageSourceOracle",
++    "VanillaCollisionOracle",
++    "VanillaFaceVisibilityOracle",
++    "VanillaGameplayFactsExporter",
++    "VanillaEntityTypesExporter",
++    "VanillaBlockBehaviourExporter",
++    "VanillaCommandParseOracle",
++    "VanillaCreativeTabsExporter",
++    "VanillaSimpleBlockOracle",
++    "VanillaStructureBlockExporter",
++    "PrepareWorker",
++];
++const CLIENT: &[&str] = &[
++    "VanillaBlockStateBindingOracle",
++    "VanillaEntityModelExporter",
++    "VanillaMobDataExporter",
++    "PrepareWorker",
++];
++/// Facts, feature placement and structure-block exporters. javac's sourcepath
++/// pulls the helpers these classes name (`VanillaBlockSurvivalOracle` and so on).
++const GENERATOR: &[&str] = &[
++    "VanillaHeightmapOracle",
++    "VanillaSimpleBlockOracle",
++    "VanillaStructureBlockExporter",
++    "PrepareWorker",
++];
++
++fn files(dir: &Path) -> Result<Vec<PathBuf>, String> {
++    let mut result = Vec::new();
++    for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
++        let path = entry.map_err(|e| e.to_string())?.path();
++        if path.is_dir() {
++            result.extend(files(&path)?);
++        } else {
++            result.push(path);
++        }
++    }
++    result.sort();
++    Ok(result)
++}
++
++// research-lock pins both jars and every accepted client manifest (which pins its libraries).
++// artifacts::verify/client_libraries check those dependencies before any bundle is used.
++fn key(root: &Path) -> Result<String, String> {
++    let mut hash = sha2::Sha256::new();
++    hash.update(SETTINGS);
++    // The launcher's bundled preparer may differ from the selected game's. Hash that
++    // version's compiler settings so a newer release still selects a runtime correctly.
++    let compiler = fs::read_to_string(root.join("crates/horizon-prepare/src/exporters.rs"))
++        .unwrap_or_else(|_| include_str!("exporters.rs").into());
++    hash.update(compiler.replace('\r', ""));
++    let mut sources = files(&root.join(PARITY))?;
++    sources.retain(|p| p.extension().is_some_and(|e| e == "java"));
++    sources.push(root.join("research-lock.json"));
++    for path in sources {
++        let data: Vec<_> = read(&path)?.into_iter().filter(|b| *b != b'\r').collect();
++        hash.update(format!(
++            "{}\0{}\0",
++            relative_display(&path, root)?.replace('\\', "/"),
++            data.len()
++        ));
++        hash.update(data);
++    }
++    Ok(hex(&hash.finalize()))
++}
++
++fn outputs(dir: &Path) -> Result<Value, String> {
++    let mut hashes = Value::Object(Vec::new());
++    for path in files(dir)? {
++        if path.extension().is_some_and(|e| e == "class") {
++            let name = relative_display(&path, dir)?.replace('\\', "/");
++            // javac's sourcepath contains our sources only; enforce that at packaging too.
++            if !name.starts_with("server/dev/horizonlab/parity/")
++                && !name.starts_with("client/dev/horizonlab/parity/")
++            {
++                return Err(format!("Non-Horizon class in exporter bundle: {name}"));
++            }
++            hashes.insert(&name, Value::Str(digest(&path, "sha256")?));
++        }
++    }
++    Ok(hashes)
++}
++
++fn valid(dir: &Path, key: &str) -> bool {
++    let Ok(manifest) = read_json(&dir.join("manifest.json")) else {
++        return false;
++    };
++    manifest.get("key").and_then(Value::as_str) == Some(key)
++        && outputs(dir).is_ok_and(|hashes| {
++            !hashes.as_object().unwrap().is_empty() && manifest.get("classes") == Some(&hashes)
++        })
++}
++
++/// Whether the version ships a matching, intact bundle and needs only a Java runtime.
++pub fn available(root: &Path) -> bool {
++    key(root).is_ok_and(|key| valid(&root.join("exporters"), &key))
++}
++
++pub(crate) fn classes(run: &Run) -> Result<PathBuf, String> {
++    let key = key(&run.root)?;
++    // A generator bundle is only the server exporters worldgen reads. It must
++    // not satisfy, or be satisfied by, a full client prepare's `exporters/`.
++    let bundle = if run.generator {
++        "exporters-generator"
++    } else {
++        "exporters"
++    };
++    let shipped = run.root.join(bundle);
++    if valid(&shipped, &key) {
++        return Ok(shipped);
++    }
++    let cached = run.local.join(bundle).join(&key);
++    if valid(&cached, &key) {
++        return Ok(cached);
++    }
++    // Build privately: an interrupted compiler or another preparer cannot publish partial classes.
++    let destination = cached;
++    let cached = run
++        .local
++        .join(bundle)
++        .join(format!(".{key}-{}", std::process::id()));
++    if cached.exists() {
++        fs::remove_dir_all(&cached).map_err(|e| e.to_string())?;
++    }
++    mkdir(&cached)?;
++    let jdk = java::find(run.java_major, &[run.jdk.home()])?;
++    let sides: Vec<(&str, &[&str], &String)> = if run.generator {
++        vec![("server", GENERATOR, &run.server_classpath)]
++    } else {
++        vec![
++            ("server", SERVER, &run.server_classpath),
++            ("client", CLIENT, &run.client_classpath),
++        ]
++    };
++    for (side, mains, cp) in sides {
++        (run.log)(&format!("Compiling {side} exporters (shared helpers once)"));
++        let classes = cached.join(side);
++        mkdir(&classes)?;
++        let log = run.log_file(&cached.join(format!("{side}.log")))?;
++        let mut args = vec![
++            "-encoding".into(),
++            "UTF-8".into(),
++            "-cp".into(),
++            cp.clone(),
++            "-sourcepath".into(),
++            arg(&run.root.join("mods/horizon/src/test/java")),
++            "-d".into(),
++            arg(&classes),
++        ];
++        args.extend(mains.iter().map(|n| arg(&run.oracle(&format!("{n}.java")))));
++        jdk.javac(run.java_major, &args, &log)?;
++        let validate = vec![
++            "-Xverify:all".into(),
++            "-cp".into(),
++            format!(
++                "{}{}{}",
++                classes.display(),
++                if cfg!(windows) { ";" } else { ":" },
++                cp
++            ),
++            "dev.horizonlab.parity.PrepareWorker".into(),
++            "validate".into(),
++            arg(&classes),
++        ];
++        // No exporter executes here: resolve every class and its signatures against pinned jars.
++        run.jdk.java(&validate, None, &log)?;
++    }
++    let manifest = Value::Object(vec![
++        ("key".into(), Value::Str(key.clone())),
++        ("classes".into(), outputs(&cached)?),
++    ]);
++    write_json(&cached.join("manifest.json"), &manifest)?;
++    if valid(&destination, &key) {
++        fs::remove_dir_all(&cached).map_err(|e| e.to_string())?;
++    } else {
++        if destination.exists() {
++            fs::remove_dir_all(&destination).map_err(|e| e.to_string())?;
++        }
++        fs::rename(&cached, &destination).map_err(|e| e.to_string())?;
++    }
++    Ok(destination)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn bundles_invalidate_sources_pins_and_damaged_classes() {
++        let root = std::env::temp_dir().join(format!("prepare-bundle-{}", std::process::id()));
++        let source = root.join(PARITY).join("VanillaHeightmapOracle.java");
++        mkdir(source.parent().unwrap()).unwrap();
++        write(&source, b"original\n").unwrap();
++        let compiler = root.join("crates/horizon-prepare/src/exporters.rs");
++        mkdir(compiler.parent().unwrap()).unwrap();
++        write(&compiler, b"--release 25 -proc:none").unwrap();
++        write(&root.join("research-lock.json"), b"pins").unwrap();
++        let original = key(&root).unwrap();
++        write(&compiler, b"--release 26 -proc:none").unwrap();
++        assert_ne!(key(&root).unwrap(), original);
++        write(&compiler, b"--release 25 -proc:none").unwrap();
++        write(&source, b"original\r\n").unwrap();
++        assert_eq!(key(&root).unwrap(), original);
++        write(&source, b"changed").unwrap();
++        assert_ne!(key(&root).unwrap(), original);
++        write(&source, b"original\n").unwrap();
++        write(&root.join("research-lock.json"), b"new dependencies").unwrap();
++        assert_ne!(key(&root).unwrap(), original);
++        write(&root.join("research-lock.json"), b"pins").unwrap();
++        let bundle = root.join("exporters");
++        let class = bundle.join("server/dev/horizonlab/parity/Helper.class");
++        mkdir(class.parent().unwrap()).unwrap();
++        write(&class, b"compiled").unwrap();
++        write_json(
++            &bundle.join("manifest.json"),
++            &Value::Object(vec![
++                ("key".into(), Value::Str(original)),
++                ("classes".into(), outputs(&bundle).unwrap()),
++            ]),
++        )
++        .unwrap();
++        assert!(available(&root));
++        write(&class, b"damaged").unwrap();
++        assert!(!available(&root));
++        fs::remove_file(&class).unwrap();
++        assert!(!available(&root));
++        fs::remove_dir_all(root).unwrap();
++    }
++}
+diff --git a/crates/horizon-prepare/src/lib.rs b/crates/horizon-prepare/src/lib.rs
+index 08ebe6b16..4e01c27d2 100644
+--- a/crates/horizon-prepare/src/lib.rs
++++ b/crates/horizon-prepare/src/lib.rs
+@@ -311,6 +311,8 @@ struct Run<'a> {
+     previous: Value,
+     origin: Value,
+     log: Log<'a>,
++    /// Facts, biome-parameter reports and the worldgen bundle only.
++    generator: bool,
+ }
+ 
+ const PARITY: &str = "mods/horizon/src/test/java/dev/horizonlab/parity";
+@@ -419,15 +421,28 @@ impl Run<'_> {
+ 
+ /// Prepares the resources; returns their folder (`.local/horizon-client/<version>`).
+ pub fn prepare(options: &Options, log: Log) -> Result<PathBuf, String> {
+-    prepare_impl(options, log, false)
++    prepare_impl(options, log, false, false)
+ }
+ 
+ /// Release build tool: compile and link-check only Horizon's original exporter classes.
+ pub fn compile_exporters(options: &Options, log: Log) -> Result<PathBuf, String> {
+-    prepare_impl(options, log, true)
++    prepare_impl(options, log, true, false)
+ }
+ 
+-fn prepare_impl(options: &Options, log: Log, compile_only: bool) -> Result<PathBuf, String> {
++/// The resources `GeneratorData::load` reads, and nothing else: `facts.json`,
++/// the vanilla data-generator biome-parameter reports, and the worldgen bundle
++/// (`prepare_worldgen`). Models, sounds and the rest of the client are not built.
++/// Returns `.local/horizon-client/<version>` under `options.root`.
++pub fn prepare_generator(options: &Options, log: Log) -> Result<PathBuf, String> {
++    prepare_impl(options, log, false, true)
++}
++
++fn prepare_impl(
++    options: &Options,
++    log: Log,
++    compile_only: bool,
++    generator: bool,
++) -> Result<PathBuf, String> {
+     let root = &std::path::absolute(&options.root)
+         .map_err(|e| format!("{}: {e}", options.root.display()))?;
+     let lock = artifacts::Lock::read(root)?;
+@@ -499,10 +514,19 @@ fn prepare_impl(options: &Options, log: Log, compile_only: bool) -> Result<PathB
+         previous,
+         origin,
+         log,
++        generator,
+     };
+     if compile_only {
+         return Ok(run.bundle()?.to_path_buf());
+     }
++    if generator {
++        generator_steps(&run, &lock)?;
++        log(&format!(
++            "Prepared worldgen resources: {}",
++            resources.display()
++        ));
++        return Ok(resources);
++    }
+     steps(&run, &lock, &oracle, options.minecraft_dir.as_deref())?;
+     log(&format!(
+         "Prepared Horizon native-client resources: {}",
+@@ -515,6 +539,73 @@ fn arg(path: &Path) -> String {
+     path.display().to_string()
+ }
+ 
++/// Facts, vanilla `--reports` (for `biome_parameters`) and `prepare_worldgen`.
++fn generator_steps(run: &Run, lock: &artifacts::Lock) -> Result<(), String> {
++    let root = &run.resources;
++    let server_cp = run.server_classpath.as_str();
++    let oracle = run.oracle("VanillaHeightmapOracle.java");
++    let facts = root.join("facts.json");
++    let origin_same = run
++        .origin
++        .as_object()
++        .unwrap()
++        .iter()
++        .all(|(k, v)| run.previous(k) == Some(v));
++    if !(origin_same
++        && facts.exists()
++        && run.previous("facts_sha256") == Some(&run.file_hash("facts.json")?))
++    {
++        run.export(
++            "block states",
++            server_cp,
++            &root.join("classes"),
++            &[&oracle],
++            &["VanillaHeightmapOracle"],
++            "512M",
++            &["export".into(), arg(&facts)],
++            &root.join("export.log"),
++        )?;
++    }
++
++    let biomes = root.join("biome-parameters").join("overworld.json");
++    if !biomes.is_file() || !run.same("server_sha256") {
++        (run.log)("Running vanilla's data generator reports");
++        let datagen = run.local.join("datagen");
++        mkdir(&datagen)?;
++        let log_path = datagen.join("datagen.log");
++        let log = run.log_file(&log_path)?;
++        run.jdk
++            .java(
++                &[
++                    "-DbundlerMainClass=net.minecraft.data.Main".into(),
++                    "-jar".into(),
++                    arg(&lock.directory.join("jars").join("server.jar")),
++                    "--reports".into(),
++                    "--output".into(),
++                    "out".into(),
++                ],
++                Some(&datagen),
++                &log,
++            )
++            .map_err(|e| format!("{e} in the data generator; see {}", log_path.display()))?;
++        install_datagen_reports(root, &datagen.join("out").join("reports"))?;
++    }
++    if !biomes.is_file() {
++        return Err(format!("data generator did not write {}", biomes.display()));
++    }
++
++    prepare_worldgen(run)?;
++
++    let mut manifest = vec![("schema".to_string(), Value::Int(SCHEMA.to_string()))];
++    manifest.extend(run.origin.as_object().unwrap().iter().cloned());
++    manifest.push(("facts_sha256".into(), run.file_hash("facts.json")?));
++    manifest.push(("generator".into(), Value::Int("1".into())));
++    write_json(
++        &root.join("horizon-resources.json"),
++        &Value::Object(manifest),
++    )
++}
++
+ fn steps(
+     run: &Run,
+     lock: &artifacts::Lock,
+diff --git a/crates/horizon-world/src/worldgen/generator.rs b/crates/horizon-world/src/worldgen/generator.rs
+index 02a8f5480..e7dd01a2d 100644
+--- a/crates/horizon-world/src/worldgen/generator.rs
++++ b/crates/horizon-world/src/worldgen/generator.rs
+@@ -785,6 +785,200 @@ impl ProtoChunk {
+             .and_then(|map| map.first_available(x & 15, z & 15).ok())
+             .unwrap_or(self.terrain.min_y())
+     }
++
++    /// A terrain-stage chunk from column heights and a cave mask, with the
++    /// biomes the caller already sampled. No density router and no structure
++    /// starts. `decorate` accepts the result: heightmaps are primed and the
++    /// stage is TERRAIN.
++    ///
++    /// `columns.surface[z * 16 + x]` is the y of the top solid block.
++    /// `columns.caves[((y - min_y) as usize) * 256 + z * 16 + x] != 0` is a cave.
++    /// The mask length is `height * 256`.
++    pub fn from_approximate(
++        data: &Arc<GeneratorData>,
++        pos: ChunkPos,
++        biomes: BiomeChunk<BiomeId>,
++        columns: ApproximateColumns<'_>,
++    ) -> Result<Self, GeneratorError> {
++        fill_approximate(data, pos, biomes, columns)
++    }
++}
++
++/// Column grids for [`ProtoChunk::from_approximate`].
++pub struct ApproximateColumns<'a> {
++    pub min_y: i32,
++    pub height: i32,
++    pub sea_level: i32,
++    pub default_block: BlockStateId,
++    pub default_fluid: BlockStateId,
++    /// `surface[z * 16 + x]` is the y of the top solid block.
++    pub surface: &'a [i32; 256],
++    /// One byte per block. Index `((y - min_y) as usize) * 256 + z * 16 + x`.
++    /// Non-zero is a cave. Length is `height * 256`.
++    pub caves: &'a [u8],
++}
++
++#[derive(Clone, Copy)]
++enum Cover {
++    Grass,
++    Sand,
++    Gravel,
++}
++
++fn cover_of(name: &str) -> Cover {
++    if name.contains("desert") || name.contains("beach") || name.contains("badlands") {
++        Cover::Sand
++    } else if name.contains("stony") || name.contains("gravel") || name.contains("frozen_peaks") {
++        Cover::Gravel
++    } else if name.contains("ocean") || name.contains("river") {
++        Cover::Sand
++    } else {
++        Cover::Grass
++    }
++}
++
++fn registry_block(data: &GeneratorData, name: &str) -> Result<BlockStateId, GeneratorError> {
++    data.registry()
++        .default_state(name)
++        .ok_or_else(|| resource(format!("missing block {name}")))
++}
++
++fn fill_approximate(
++    data: &Arc<GeneratorData>,
++    pos: ChunkPos,
++    biomes: BiomeChunk<BiomeId>,
++    columns: ApproximateColumns<'_>,
++) -> Result<ProtoChunk, GeneratorError> {
++    if columns.height <= 0 || columns.height % 16 != 0 {
++        return Err(resource(
++            "approximate fill needs a positive multiple of 16 for the build height",
++        ));
++    }
++    let cells = columns.height as usize * 256;
++    if columns.caves.len() != cells {
++        return Err(resource(format!(
++            "cave mask has {} entries, expected {cells}",
++            columns.caves.len()
++        )));
++    }
++    let max_y = columns.min_y + columns.height - 1;
++    let default_name = data
++        .registry()
++        .state(columns.default_block)
++        .map(|state| state.name.as_str())
++        .unwrap_or("");
++    let layered = default_name == "minecraft:stone";
++    let nether = default_name == "minecraft:netherrack";
++    let bedrock = registry_block(data, "minecraft:bedrock")?;
++    let (grass, dirt, sand, gravel, deepslate) = if layered {
++        (
++            registry_block(data, "minecraft:grass_block")?,
++            registry_block(data, "minecraft:dirt")?,
++            registry_block(data, "minecraft:sand")?,
++            registry_block(data, "minecraft:gravel")?,
++            registry_block(data, "minecraft:deepslate")?,
++        )
++    } else {
++        (
++            BlockStateId(0),
++            BlockStateId(0),
++            BlockStateId(0),
++            BlockStateId(0),
++            BlockStateId(0),
++        )
++    };
++    let fluid = if data.block_states().get(columns.default_fluid).air {
++        None
++    } else {
++        Some(columns.default_fluid)
++    };
++    let mut chunk = TerrainChunk::new(
++        pos,
++        columns.min_y,
++        columns.height,
++        data.registry(),
++        data.block_states().clone(),
++    )
++    .map_err(stage("approximate"))?;
++    let origin_x = pos.x.wrapping_shl(4);
++    let origin_z = pos.z.wrapping_shl(4);
++    for lz in 0..16 {
++        for lx in 0..16 {
++            let wx = origin_x.wrapping_add(lx);
++            let wz = origin_z.wrapping_add(lz);
++            let column = (lz * 16 + lx) as usize;
++            let surface = columns.surface[column].clamp(columns.min_y, max_y);
++            let biome = *biomes.noise_biome([wx >> 2, columns.sea_level >> 2, wz >> 2]);
++            let cover = cover_of(data.biome_name(biome));
++            let cave_at = |y: i32| -> bool {
++                let yi = (y - columns.min_y) as usize;
++                columns.caves[yi * 256 + column] != 0
++            };
++            let solid = |y: i32| -> BlockStateId {
++                if !layered {
++                    return columns.default_block;
++                }
++                if y > surface - 4 {
++                    return match cover {
++                        Cover::Grass if y == surface && surface >= columns.sea_level => grass,
++                        Cover::Grass => dirt,
++                        Cover::Sand => sand,
++                        Cover::Gravel => gravel,
++                    };
++                }
++                if y < 0 {
++                    deepslate
++                } else {
++                    columns.default_block
++                }
++            };
++            let at = |y: i32| -> Option<BlockStateId> {
++                if y == columns.min_y || (nether && y == max_y) {
++                    return Some(bedrock);
++                }
++                if y > surface {
++                    return if y < columns.sea_level { fluid } else { None };
++                }
++                if cave_at(y) {
++                    return if y < columns.sea_level { fluid } else { None };
++                }
++                Some(solid(y))
++            };
++            let mut y = if nether {
++                max_y
++            } else {
++                surface.max(columns.sea_level - 1).min(max_y)
++            };
++            while y >= columns.min_y {
++                let Some(state) = at(y) else {
++                    y -= 1;
++                    continue;
++                };
++                let mut bot = y;
++                while bot > columns.min_y && at(bot - 1) == Some(state) {
++                    bot -= 1;
++                }
++                chunk
++                    .fill_solid_run(wx, y, wz, y - bot + 1, state)
++                    .map_err(stage("approximate"))?;
++                y = bot - 1;
++            }
++        }
++    }
++    chunk
++        .prime_heightmaps(PreLightChunkStage::Terrain.heightmaps())
++        .map_err(stage("approximate"))?;
++    chunk.set_generation_stage(PreLightChunkStage::Terrain);
++    Ok(ProtoChunk {
++        terrain: chunk,
++        biomes,
++        data: Arc::clone(data),
++        decorated: false,
++        block_entities: Vec::new(),
++        structure_starts: Vec::new(),
++        own_starts: Starts::default(),
++        entities: Vec::new(),
++    })
+ }
+ 
+ /// Per-noise-settings values resolved from the dimension's generator JSON.
+@@ -2016,6 +2210,15 @@ trait SeededPipeline: Send + Sync {
+         worker: &mut WorkerState,
+         pos: ChunkPos,
+     ) -> Result<ProtoChunk, GeneratorError>;
++    /// Terrain-stage chunk from approximate column heights and a cave mask.
++    /// Biomes come from this dimension's biome source. Structures are not built.
++    fn generate_fast(
++        &self,
++        worker: &mut WorkerState,
++        pos: ChunkPos,
++        surface: &[i32; 256],
++        caves: &[u8],
++    ) -> Result<ProtoChunk, GeneratorError>;
+     fn decorate(
+         &self,
+         worker: &mut WorkerState,
+@@ -2091,6 +2294,29 @@ where
+     ) -> Result<ProtoChunk, GeneratorError> {
+         Pipeline::generate(self, worker, pos)
+     }
++    fn generate_fast(
++        &self,
++        worker: &mut WorkerState,
++        pos: ChunkPos,
++        surface: &[i32; 256],
++        caves: &[u8],
++    ) -> Result<ProtoChunk, GeneratorError> {
++        let biomes = (*self.biome_chunk(worker, pos)?).clone();
++        ProtoChunk::from_approximate(
++            &self.data,
++            pos,
++            biomes,
++            ApproximateColumns {
++                min_y: self.settings.level_min_y,
++                height: self.settings.level_height,
++                sea_level: self.settings.sea_level,
++                default_block: self.settings.default_block,
++                default_fluid: self.settings.default_fluid,
++                surface,
++                caves,
++            },
++        )
++    }
+     fn decorate(
+         &self,
+         worker: &mut WorkerState,
+@@ -3006,6 +3232,19 @@ impl GeneratorWorker {
+         self.state.timings.chunks += 1;
+         result
+     }
++    /// Approximate terrain at the TERRAIN stage: the column grids replace the
++    /// density fill. Biomes are this dimension's real biome source, so
++    /// `decorate` still places the biome's ores, trees and plants. Structure
++    /// starts are empty.
++    pub fn generate_fast(
++        &mut self,
++        pos: ChunkPos,
++        surface: &[i32; 256],
++        caves: &[u8],
++    ) -> Result<ProtoChunk, GeneratorError> {
++        self.pipeline
++            .generate_fast(&mut self.state, pos, surface, caves)
++    }
+     /// Noise/aquifer surface and its material rule, without chunks, structures or features.
+     pub fn surface_sample(&mut self, x: i32, z: i32) -> Option<SurfaceSample> {
+         self.pipeline.surface_sample(&mut self.state, x, z, None)

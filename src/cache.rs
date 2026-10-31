@@ -37,6 +37,11 @@ fn named_root(name: &str) -> PathBuf {
     home.join(".local").join("share").join(name).join(VANILLA_VERSION)
 }
 
+/// Where a menu download of the pinned server jar is stored.
+pub fn server_jar_download() -> PathBuf {
+    named_root("brahma").join("server.jar")
+}
+
 /// New prepares use `brahma`. A cache already prepared under the old name is
 /// reused so the jars are not extracted again.
 fn cache_root() -> PathBuf {

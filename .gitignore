@@ -1,5 +1,7 @@
 /target
 /worlds
+# Pinned Horizon checkout plus patches/horizon.patch. Not source of this repo.
+.horizon/
 .idea/
 *.txt.tmp
 __pycache__/
